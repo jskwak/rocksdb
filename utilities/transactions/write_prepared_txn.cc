@@ -211,6 +211,8 @@ Status WritePreparedTxn::RollbackInternal() {
   WriteBatch rollback_batch;
   assert(GetId() != kMaxSequenceNumber);
   assert(GetId() > 0);
+  auto cf_map_shared_ptr = wpt_db_->GetCFHandleMap();
+  auto cf_comp_map_shared_ptr = wpt_db_->GetCFComparatorMap();
   // In WritePrepared, the txn is is the same as prepare seq
   auto last_visible_txn = GetId() - 1;
   struct RollbackWriteBatchBuilder : public WriteBatch::Handler {
@@ -219,6 +221,7 @@ Status WritePreparedTxn::RollbackInternal() {
     WritePreparedTxnReadCallback callback;
     WriteBatch* rollback_batch_;
     std::map<uint32_t, const Comparator*>& comparators_;
+    std::map<uint32_t, ColumnFamilyHandle*>& handles_;
     using CFKeys = std::set<Slice, SetComparator>;
     std::map<uint32_t, CFKeys> keys_;
     bool rollback_merge_operands_;
@@ -226,12 +229,14 @@ Status WritePreparedTxn::RollbackInternal() {
         DBImpl* db, WritePreparedTxnDB* wpt_db, SequenceNumber snap_seq,
         WriteBatch* dst_batch,
         std::map<uint32_t, const Comparator*>& comparators,
+        std::map<uint32_t, ColumnFamilyHandle*>& handles,
         bool rollback_merge_operands)
         : db_(db),
           callback(wpt_db, snap_seq,
                    0),  // 0 disables min_uncommitted optimization
           rollback_batch_(dst_batch),
           comparators_(comparators),
+          handles_(handles),
           rollback_merge_operands_(rollback_merge_operands) {}
 
     Status Rollback(uint32_t cf, const Slice& key) {
@@ -249,7 +254,7 @@ Status WritePreparedTxn::RollbackInternal() {
 
       PinnableSlice pinnable_val;
       bool not_used;
-      auto cf_handle = db_->GetColumnFamilyHandle(cf);
+      auto cf_handle = handles_[cf];
       s = db_->GetImpl(roptions, cf_handle, key, &pinnable_val, &not_used,
                        &callback);
       assert(s.ok() || s.IsNotFound());
@@ -299,7 +304,7 @@ Status WritePreparedTxn::RollbackInternal() {
    protected:
     virtual bool WriteAfterCommit() const override { return false; }
   } rollback_handler(db_impl_, wpt_db_, last_visible_txn, &rollback_batch,
-                     *wpt_db_->GetCFComparatorMap(),
+                     *cf_comp_map_shared_ptr.get(), *cf_map_shared_ptr.get(),
                      wpt_db_->txn_db_options_.rollback_merge_operands);
   auto s = GetWriteBatch()->GetWriteBatch()->Iterate(&rollback_handler);
   assert(s.ok());
@@ -312,10 +317,16 @@ Status WritePreparedTxn::RollbackInternal() {
   const bool DISABLE_MEMTABLE = true;
   const uint64_t NO_REF_LOG = 0;
   uint64_t seq_used = kMaxSequenceNumber;
-  const size_t ZERO_PREPARES = 0;
   const size_t ONE_BATCH = 1;
+  // We commit the rolled back prepared batches. ALthough this is
+  // counter-intuitive, i) it is safe to do so, since the prepared batches are
+  // already canceled out by the rollback batch, ii) adding the commit entry to
+  // CommitCache will allow us to benefit from the existing mechanism in
+  // CommitCache that keeps an entry evicted due to max advance and yet overlaps
+  // with a live snapshot around so that the live snapshot properly skips the
+  // entry even if its prepare seq is lower than max_evicted_seq_.
   WritePreparedCommitEntryPreReleaseCallback update_commit_map(
-      wpt_db_, db_impl_, kMaxSequenceNumber, ZERO_PREPARES, ONE_BATCH);
+      wpt_db_, db_impl_, GetId(), prepare_batch_cnt_, ONE_BATCH);
   // Note: the rollback batch does not need AddPrepared since it is written to
   // DB in one shot. min_uncommitted still works since it requires capturing
   // data that is written to DB but not yet committed, while
@@ -328,11 +339,7 @@ Status WritePreparedTxn::RollbackInternal() {
     return s;
   }
   if (do_one_write) {
-    // Mark the txn as rolled back
-    uint64_t& rollback_seq = seq_used;
-    for (size_t i = 0; i < prepare_batch_cnt_; i++) {
-      wpt_db_->RollbackPrepared(GetId() + i, rollback_seq);
-    }
+    wpt_db_->RemovePrepared(GetId(), prepare_batch_cnt_);
     return s;
   }  // else do the 2nd write for commit
   uint64_t& prepare_seq = seq_used;
@@ -355,9 +362,16 @@ Status WritePreparedTxn::RollbackInternal() {
   // Mark the txn as rolled back
   uint64_t& rollback_seq = seq_used;
   if (s.ok()) {
+    // Note: it is safe to do it after PreReleaseCallback via WriteImpl since
+    // all the writes by the prpared batch are already blinded by the rollback
+    // batch. The only reason we commit the prepared batch here is to benefit
+    // from the existing mechanism in CommitCache that takes care of the rare
+    // cases that the prepare seq is visible to a snsapshot but max evicted seq
+    // advances that prepare seq.
     for (size_t i = 0; i < prepare_batch_cnt_; i++) {
-      wpt_db_->RollbackPrepared(GetId() + i, rollback_seq);
+      wpt_db_->AddCommitted(GetId() + i, rollback_seq);
     }
+    wpt_db_->RemovePrepared(GetId(), prepare_batch_cnt_);
   }
 
   return s;

@@ -177,17 +177,16 @@ void ParseTablePropertiesString(std::string tp_string, TableProperties* tp) {
   std::replace(tp_string.begin(), tp_string.end(), ';', ' ');
   std::replace(tp_string.begin(), tp_string.end(), '=', ' ');
   ResetTableProperties(tp);
-
   sscanf(tp_string.c_str(),
          "# data blocks %" SCNu64 " # entries %" SCNu64 " raw key size %" SCNu64
          " raw average key size %lf "
          " raw value size %" SCNu64
          " raw average value size %lf "
-         " data block size %" SCNu64 " index block size %" SCNu64
-         " filter block size %" SCNu64,
+         " data block size %" SCNu64 " index block size (user-key? %" SCNu64
+         ") %" SCNu64 " filter block size %" SCNu64,
          &tp->num_data_blocks, &tp->num_entries, &tp->raw_key_size,
          &dummy_double, &tp->raw_value_size, &dummy_double, &tp->data_size,
-         &tp->index_size, &tp->filter_size);
+         &tp->index_key_is_user_key, &tp->index_size, &tp->filter_size);
 }
 
 void VerifySimilar(uint64_t a, uint64_t b, double bias) {
@@ -224,7 +223,8 @@ void GetExpectedTableProperties(TableProperties* expected_tp,
                                 const int kKeySize, const int kValueSize,
                                 const int kKeysPerTable, const int kTableCount,
                                 const int kBloomBitsPerKey,
-                                const size_t kBlockSize) {
+                                const size_t kBlockSize,
+                                const bool index_key_is_user_key) {
   const int kKeyCount = kTableCount * kKeysPerTable;
   const int kAvgSuccessorSize = kKeySize / 5;
   const int kEncodingSavePerKey = kKeySize / 4;
@@ -238,7 +238,8 @@ void GetExpectedTableProperties(TableProperties* expected_tp,
   expected_tp->data_size =
       kTableCount * (kKeysPerTable * (kKeySize + 8 + kValueSize));
   expected_tp->index_size =
-      expected_tp->num_data_blocks * (kAvgSuccessorSize + 8);
+      expected_tp->num_data_blocks *
+      (kAvgSuccessorSize + (index_key_is_user_key ? 0 : 8));
   expected_tp->filter_size =
       kTableCount * (kKeysPerTable * kBloomBitsPerKey / 8);
 }
@@ -251,8 +252,11 @@ TEST_F(DBPropertiesTest, ValidatePropertyInfo) {
     ASSERT_TRUE(ppt_name_and_info.first.empty() ||
                 !isdigit(ppt_name_and_info.first.back()));
 
-    ASSERT_TRUE((ppt_name_and_info.second.handle_string == nullptr) !=
-                (ppt_name_and_info.second.handle_int == nullptr));
+    int count = 0;
+    count += (ppt_name_and_info.second.handle_string == nullptr) ? 0 : 1;
+    count += (ppt_name_and_info.second.handle_int == nullptr) ? 0 : 1;
+    count += (ppt_name_and_info.second.handle_string_dbimpl == nullptr) ? 0 : 1;
+    ASSERT_TRUE(count == 1);
   }
 }
 
@@ -315,14 +319,14 @@ TEST_F(DBPropertiesTest, AggregatedTableProperties) {
     }
     std::string property;
     db_->GetProperty(DB::Properties::kAggregatedTableProperties, &property);
+    TableProperties output_tp;
+    ParseTablePropertiesString(property, &output_tp);
+    bool index_key_is_user_key = output_tp.index_key_is_user_key > 0;
 
     TableProperties expected_tp;
     GetExpectedTableProperties(&expected_tp, kKeySize, kValueSize,
                                kKeysPerTable, kTableCount, kBloomBitsPerKey,
-                               table_options.block_size);
-
-    TableProperties output_tp;
-    ParseTablePropertiesString(property, &output_tp);
+                               table_options.block_size, index_key_is_user_key);
 
     VerifyTableProperties(expected_tp, output_tp);
   }
@@ -371,6 +375,13 @@ TEST_F(DBPropertiesTest, ReadLatencyHistogramByLevel) {
   for (int key = 0; key < key_index; key++) {
     Get(Key(key));
   }
+
+  // Test for getting immutable_db_options_.statistics
+  ASSERT_TRUE(dbfull()->GetProperty(dbfull()->DefaultColumnFamily(),
+                                    "rocksdb.options-statistics", &prop));
+  ASSERT_NE(std::string::npos, prop.find("rocksdb.block.cache.miss"));
+  ASSERT_EQ(std::string::npos, prop.find("rocksdb.db.f.micros"));
+
   ASSERT_TRUE(dbfull()->GetProperty(dbfull()->DefaultColumnFamily(),
                                     "rocksdb.cf-file-histogram", &prop));
   ASSERT_NE(std::string::npos, prop.find("** Level 0 read latency histogram"));
@@ -489,6 +500,7 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
     }
     db_->GetProperty(DB::Properties::kAggregatedTableProperties, &tp_string);
     ParseTablePropertiesString(tp_string, &tp);
+    bool index_key_is_user_key = tp.index_key_is_user_key > 0;
     ASSERT_EQ(sum_tp.data_size, tp.data_size);
     ASSERT_EQ(sum_tp.index_size, tp.index_size);
     ASSERT_EQ(sum_tp.filter_size, tp.filter_size);
@@ -497,9 +509,9 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
     ASSERT_EQ(sum_tp.num_data_blocks, tp.num_data_blocks);
     ASSERT_EQ(sum_tp.num_entries, tp.num_entries);
     if (table > 3) {
-      GetExpectedTableProperties(&expected_tp, kKeySize, kValueSize,
-                                 kKeysPerTable, table, kBloomBitsPerKey,
-                                 table_options.block_size);
+      GetExpectedTableProperties(
+          &expected_tp, kKeySize, kValueSize, kKeysPerTable, table,
+          kBloomBitsPerKey, table_options.block_size, index_key_is_user_key);
       // Gives larger bias here as index block size, filter block size,
       // and data block size become much harder to estimate in this test.
       VerifyTableProperties(tp, expected_tp, 0.5, 0.4, 0.4, 0.25);
@@ -1434,6 +1446,107 @@ TEST_F(DBPropertiesTest, SstFilesSize) {
   // Compact to clean all keys and trigger listener.
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
   ASSERT_TRUE(listener->callback_triggered);
+}
+
+TEST_F(DBPropertiesTest, BlockCacheProperties) {
+  Options options;
+  uint64_t value;
+
+  // Block cache properties are not available for tables other than
+  // block-based table.
+  options.table_factory.reset(NewPlainTableFactory());
+  Reopen(options);
+  ASSERT_FALSE(
+      db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_FALSE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_FALSE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+
+  options.table_factory.reset(NewCuckooTableFactory());
+  Reopen(options);
+  ASSERT_FALSE(
+      db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_FALSE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_FALSE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+
+  // Block cache properties are not available if block cache is not used.
+  BlockBasedTableOptions table_options;
+  table_options.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+  ASSERT_FALSE(
+      db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_FALSE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_FALSE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+
+  // Test with empty block cache.
+  constexpr size_t kCapacity = 100;
+  auto block_cache = NewLRUCache(kCapacity, 0 /*num_shard_bits*/);
+  table_options.block_cache = block_cache;
+  table_options.no_block_cache = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_EQ(kCapacity, value);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_EQ(0, value);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+  ASSERT_EQ(0, value);
+
+  // Insert unpinned item to the cache and check size.
+  constexpr size_t kSize1 = 50;
+  block_cache->Insert("item1", nullptr /*value*/, kSize1, nullptr /*deleter*/);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_EQ(kCapacity, value);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_EQ(kSize1, value);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+  ASSERT_EQ(0, value);
+
+  // Insert pinned item to the cache and check size.
+  constexpr size_t kSize2 = 30;
+  Cache::Handle* item2 = nullptr;
+  block_cache->Insert("item2", nullptr /*value*/, kSize2, nullptr /*deleter*/,
+                      &item2);
+  ASSERT_NE(nullptr, item2);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_EQ(kCapacity, value);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_EQ(kSize1 + kSize2, value);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+  ASSERT_EQ(kSize2, value);
+
+  // Insert another pinned item to make the cache over-sized.
+  constexpr size_t kSize3 = 80;
+  Cache::Handle* item3 = nullptr;
+  block_cache->Insert("item3", nullptr /*value*/, kSize3, nullptr /*deleter*/,
+                      &item3);
+  ASSERT_NE(nullptr, item2);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_EQ(kCapacity, value);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  // Item 1 is evicted.
+  ASSERT_EQ(kSize2 + kSize3, value);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+  ASSERT_EQ(kSize2 + kSize3, value);
+
+  // Check size after release.
+  block_cache->Release(item2);
+  block_cache->Release(item3);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheCapacity, &value));
+  ASSERT_EQ(kCapacity, value);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  // item2 will be evicted, while item3 remain in cache after release.
+  ASSERT_EQ(kSize3, value);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kBlockCachePinnedUsage, &value));
+  ASSERT_EQ(0, value);
 }
 
 #endif  // ROCKSDB_LITE

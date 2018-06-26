@@ -85,6 +85,10 @@ ifeq ($(MAKECMDGOALS),rocksdbjavastaticrelease)
 	DEBUG_LEVEL=0
 endif
 
+ifeq ($(MAKECMDGOALS),rocksdbjavastaticreleasedocker)
+        DEBUG_LEVEL=0
+endif
+
 ifeq ($(MAKECMDGOALS),rocksdbjavastaticpublish)
 	DEBUG_LEVEL=0
 endif
@@ -224,6 +228,9 @@ ifdef COMPILE_WITH_TSAN
 	PROFILING_FLAGS =
 	# LUA is not supported under TSAN
 	LUA_PATH =
+	# Limit keys for crash test under TSAN to avoid error:
+	# "ThreadSanitizer: DenseSlabAllocator overflow. Dying."
+	CRASH_TEST_EXT_ARGS += --max_key=1000000
 endif
 
 # AIX doesn't work with -pg
@@ -399,6 +406,7 @@ TESTS = \
 	db_blob_index_test \
 	db_bloom_filter_test \
 	db_iter_test \
+	db_iter_stress_test \
 	db_log_iter_test \
 	db_compaction_filter_test \
 	db_compaction_test \
@@ -514,6 +522,7 @@ TESTS = \
 	repair_test \
 	env_timed_test \
 	write_prepared_transaction_test \
+	write_unprepared_transaction_test \
 	db_universal_compaction_test \
 
 PARALLEL_TEST = \
@@ -533,6 +542,7 @@ PARALLEL_TEST = \
 	table_test \
 	transaction_test \
 	write_prepared_transaction_test \
+	write_unprepared_transaction_test \
 
 # options_settable_test doesn't pass with UBSAN as we use hack in the test
 ifdef COMPILE_WITH_UBSAN
@@ -1192,6 +1202,9 @@ db_tailing_iter_test: db/db_tailing_iter_test.o db/db_test_util.o $(LIBOBJECTS) 
 db_iter_test: db/db_iter_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(AM_LINK)
 
+db_iter_stress_test: db/db_iter_stress_test.o $(LIBOBJECTS) $(TESTHARNESS)
+	$(AM_LINK)
+
 db_universal_compaction_test: db/db_universal_compaction_test.o db/db_test_util.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(AM_LINK)
 
@@ -1465,6 +1478,9 @@ transaction_test: utilities/transactions/transaction_test.o $(LIBOBJECTS) $(TEST
 	$(AM_LINK)
 
 write_prepared_transaction_test: utilities/transactions/write_prepared_transaction_test.o $(LIBOBJECTS) $(TESTHARNESS)
+	$(AM_LINK)
+
+write_unprepared_transaction_test: utilities/transactions/write_unprepared_transaction_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(AM_LINK)
 
 sst_dump: tools/sst_dump.o $(LIBOBJECTS)

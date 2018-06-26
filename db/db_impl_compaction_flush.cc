@@ -79,6 +79,9 @@ Status DBImpl::SyncClosedLogs(JobContext* job_context) {
                      "[JOB %d] Syncing log #%" PRIu64, job_context->job_id,
                      log->get_log_number());
       s = log->file()->Sync(immutable_db_options_.use_fsync);
+      if (!s.ok()) {
+        break;
+      }
     }
     if (s.ok()) {
       s = directories_.GetWalDir()->Fsync();
@@ -157,7 +160,7 @@ Status DBImpl::FlushMemTableToOutputFile(
   // and EventListener callback will be called when the db_mutex
   // is unlocked by the current thread.
   if (s.ok()) {
-    s = flush_job.Run(&file_meta);
+    s = flush_job.Run(&logs_with_prep_tracker_, &file_meta);
   } else {
     flush_job.Cancel();
   }
@@ -424,8 +427,8 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
       final_output_level--;
     }
     s = RunManualCompaction(cfd, ColumnFamilyData::kCompactAllLevels,
-                            final_output_level, options.target_path_id, begin,
-                            end, exclusive);
+                            final_output_level, options.target_path_id,
+                            options.max_subcompactions, begin, end, exclusive);
   } else {
     for (int level = 0; level <= max_level_with_files; level++) {
       int output_level;
@@ -459,7 +462,7 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
         }
       }
       s = RunManualCompaction(cfd, level, output_level, options.target_path_id,
-                              begin, end, exclusive);
+                              options.max_subcompactions, begin, end, exclusive);
       if (!s.ok()) {
         break;
       }
@@ -971,6 +974,7 @@ Status DBImpl::Flush(const FlushOptions& flush_options,
 
 Status DBImpl::RunManualCompaction(ColumnFamilyData* cfd, int input_level,
                                    int output_level, uint32_t output_path_id,
+                                   uint32_t max_subcompactions,
                                    const Slice* begin, const Slice* end,
                                    bool exclusive, bool disallow_trivial_move) {
   assert(input_level == ColumnFamilyData::kCompactAllLevels ||
@@ -1058,8 +1062,9 @@ Status DBImpl::RunManualCompaction(ColumnFamilyData* cfd, int input_level,
         (((manual.manual_end = &manual.tmp_storage1) != nullptr) &&
          ((compaction = manual.cfd->CompactRange(
                *manual.cfd->GetLatestMutableCFOptions(), manual.input_level,
-               manual.output_level, manual.output_path_id, manual.begin,
-               manual.end, &manual.manual_end, &manual_conflict)) == nullptr &&
+               manual.output_level, manual.output_path_id, max_subcompactions,
+               manual.begin, manual.end, &manual.manual_end,
+               &manual_conflict)) == nullptr &&
           manual_conflict))) {
       // exclusive manual compactions should not see a conflict during
       // CompactRange
@@ -1269,26 +1274,26 @@ DBImpl::BGJobLimits DBImpl::GetBGJobLimits(int max_background_flushes,
 }
 
 void DBImpl::AddToCompactionQueue(ColumnFamilyData* cfd) {
-  assert(!cfd->pending_compaction());
+  assert(!cfd->queued_for_compaction());
   cfd->Ref();
   compaction_queue_.push_back(cfd);
-  cfd->set_pending_compaction(true);
+  cfd->set_queued_for_compaction(true);
 }
 
 ColumnFamilyData* DBImpl::PopFirstFromCompactionQueue() {
   assert(!compaction_queue_.empty());
   auto cfd = *compaction_queue_.begin();
   compaction_queue_.pop_front();
-  assert(cfd->pending_compaction());
-  cfd->set_pending_compaction(false);
+  assert(cfd->queued_for_compaction());
+  cfd->set_queued_for_compaction(false);
   return cfd;
 }
 
 void DBImpl::AddToFlushQueue(ColumnFamilyData* cfd, FlushReason flush_reason) {
-  assert(!cfd->pending_flush());
+  assert(!cfd->queued_for_flush());
   cfd->Ref();
   flush_queue_.push_back(cfd);
-  cfd->set_pending_flush(true);
+  cfd->set_queued_for_flush(true);
   cfd->SetFlushReason(flush_reason);
 }
 
@@ -1296,31 +1301,31 @@ ColumnFamilyData* DBImpl::PopFirstFromFlushQueue() {
   assert(!flush_queue_.empty());
   auto cfd = *flush_queue_.begin();
   flush_queue_.pop_front();
-  assert(cfd->pending_flush());
-  cfd->set_pending_flush(false);
+  assert(cfd->queued_for_flush());
+  cfd->set_queued_for_flush(false);
   // TODO: need to unset flush reason?
   return cfd;
 }
 
 void DBImpl::SchedulePendingFlush(ColumnFamilyData* cfd,
                                   FlushReason flush_reason) {
-  if (!cfd->pending_flush() && cfd->imm()->IsFlushPending()) {
+  if (!cfd->queued_for_flush() && cfd->imm()->IsFlushPending()) {
     AddToFlushQueue(cfd, flush_reason);
     ++unscheduled_flushes_;
   }
 }
 
 void DBImpl::SchedulePendingCompaction(ColumnFamilyData* cfd) {
-  if (!cfd->pending_compaction() && cfd->NeedsCompaction()) {
+  if (!cfd->queued_for_compaction() && cfd->NeedsCompaction()) {
     AddToCompactionQueue(cfd);
     ++unscheduled_compactions_;
   }
 }
 
-void DBImpl::SchedulePendingPurge(std::string fname, FileType type,
-                                  uint64_t number, int job_id) {
+void DBImpl::SchedulePendingPurge(std::string fname, std::string dir_to_sync,
+                                  FileType type, uint64_t number, int job_id) {
   mutex_.AssertHeld();
-  PurgeFileInfo file_info(fname, type, number, job_id);
+  PurgeFileInfo file_info(fname, dir_to_sync, type, number, job_id);
   purge_queue_.push_back(std::move(file_info));
 }
 
@@ -1861,9 +1866,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
 
     // Clear Instrument
     ThreadStatusUtil::ResetThreadStatus();
-  } else if (c->column_family_data()->ioptions()->compaction_style ==
-                 kCompactionStyleUniversal &&
-             !is_prepicked && c->output_level() > 0 &&
+  } else if (!is_prepicked && c->output_level() > 0 &&
              c->output_level() ==
                  c->column_family_data()
                      ->current()
@@ -1871,9 +1874,9 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                      ->MaxOutputLevel(
                          immutable_db_options_.allow_ingest_behind) &&
              env_->GetBackgroundThreads(Env::Priority::BOTTOM) > 0) {
-    // Forward universal compactions involving last level to the bottom pool
-    // if it exists, such that long-running compactions can't block short-
-    // lived ones, like L0->L0s.
+    // Forward compactions involving last level to the bottom pool if it exists,
+    // such that compactions unlikely to contribute to write stalls can be
+    // delayed or deprioritized.
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:ForwardToBottomPriPool");
     CompactionArg* ca = new CompactionArg;
     ca->db = this;

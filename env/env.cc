@@ -22,6 +22,20 @@ namespace rocksdb {
 Env::~Env() {
 }
 
+std::string Env::PriorityToString(Env::Priority priority) {
+  switch (priority) {
+    case Env::Priority::BOTTOM:
+      return "Bottom";
+    case Env::Priority::LOW:
+      return "Low";
+    case Env::Priority::HIGH:
+      return "High";
+    case Env::Priority::TOTAL:
+      assert(false);
+  }
+  return "Invalid";
+}
+
 uint64_t Env::GetThreadID() const {
   std::hash<std::thread::id> hasher;
   return hasher(std::this_thread::get_id());
@@ -72,6 +86,8 @@ RandomAccessFile::~RandomAccessFile() {
 
 WritableFile::~WritableFile() {
 }
+
+MemoryMappedFileBuffer::~MemoryMappedFileBuffer() {}
 
 Logger::~Logger() {}
 
@@ -388,8 +404,7 @@ EnvOptions Env::OptimizeForCompactionTableWrite(
 EnvOptions Env::OptimizeForCompactionTableRead(
     const EnvOptions& env_options, const ImmutableDBOptions& db_options) const {
   EnvOptions optimized_env_options(env_options);
-  optimized_env_options.use_direct_reads =
-      db_options.use_direct_io_for_flush_and_compaction;
+  optimized_env_options.use_direct_reads = db_options.use_direct_reads;
   return optimized_env_options;
 }
 

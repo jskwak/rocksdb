@@ -320,6 +320,9 @@ enum Tickers : uint32_t {
   // # of times snapshot_mutex_ is acquired in the fast path.
   TXN_SNAPSHOT_MUTEX_OVERHEAD,
 
+  // Number of keys actually found in MultiGet calls (vs number requested by caller)
+  // NUMBER_MULTIGET_KEYS_READ gives the number requested by caller
+  NUMBER_MULTIGET_KEYS_FOUND,
   TICKER_ENUM_MAX
 };
 
@@ -471,6 +474,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.txn.overhead.mutex.old.commit.map"},
     {TXN_DUPLICATE_KEY_OVERHEAD, "rocksdb.txn.overhead.duplicate.key"},
     {TXN_SNAPSHOT_MUTEX_OVERHEAD, "rocksdb.txn.overhead.mutex.snapshot"},
+    {NUMBER_MULTIGET_KEYS_FOUND, "rocksdb.number.multiget.keys.found"},
 };
 
 /**
@@ -615,6 +619,8 @@ struct HistogramData {
   // zero-initialize new members since old Statistics::histogramData()
   // implementations won't write them.
   double max = 0.0;
+  uint64_t count = 0;
+  uint64_t sum = 0;
 };
 
 enum StatsLevel {

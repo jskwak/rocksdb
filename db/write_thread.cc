@@ -7,6 +7,7 @@
 #include <chrono>
 #include <thread>
 #include "db/column_family.h"
+#include "monitoring/perf_context_imp.h"
 #include "port/port.h"
 #include "util/random.h"
 #include "util/sync_point.h"
@@ -72,6 +73,10 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
     }
     port::AsmVolatilePause();
   }
+
+  // This is below the fast path, so that the stat is zero when all writes are
+  // from the same thread.
+  PERF_TIMER_GUARD(write_thread_wait_nanos);
 
   // If we're only going to end up waiting a short period of time,
   // it can be a lot more efficient to call std::this_thread::yield()
@@ -313,6 +318,7 @@ void WriteThread::JoinBatchGroup(Writer* w) {
      * 3.2) an existing memtable writer group leader tell us to finish memtable
      *      writes in parallel.
      */
+    TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:BeganWaiting", w);
     AwaitState(w, STATE_GROUP_LEADER | STATE_MEMTABLE_WRITER_LEADER |
                       STATE_PARALLEL_MEMTABLE_WRITER | STATE_COMPLETED,
                &jbg_ctx);

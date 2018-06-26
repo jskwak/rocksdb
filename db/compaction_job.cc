@@ -526,12 +526,15 @@ void CompactionJob::GenSubcompactionBoundaries() {
 
   // Group the ranges into subcompactions
   const double min_file_fill_percent = 4.0 / 5;
-  uint64_t max_output_files = static_cast<uint64_t>(
-      std::ceil(sum / min_file_fill_percent /
-                c->mutable_cf_options()->MaxFileSizeForLevel(out_lvl)));
+  int base_level = v->storage_info()->base_level();
+  uint64_t max_output_files = static_cast<uint64_t>(std::ceil(
+      sum / min_file_fill_percent /
+      MaxFileSizeForLevel(*(c->mutable_cf_options()), out_lvl,
+          c->immutable_cf_options()->compaction_style, base_level,
+          c->immutable_cf_options()->level_compaction_dynamic_level_bytes)));
   uint64_t subcompactions =
       std::min({static_cast<uint64_t>(ranges.size()),
-                static_cast<uint64_t>(db_options_.max_subcompactions),
+                static_cast<uint64_t>(c->max_subcompactions()),
                 max_output_files});
 
   if (subcompactions > 1) {
@@ -601,6 +604,69 @@ Status CompactionJob::Run() {
     if (!state.status.ok()) {
       status = state.status;
       break;
+    }
+  }
+
+  if (status.ok()) {
+    thread_pool.clear();
+    std::vector<const FileMetaData*> files_meta;
+    for (const auto& state : compact_->sub_compact_states) {
+      for (const auto& output : state.outputs) {
+        files_meta.emplace_back(&output.meta);
+      }
+    }
+    ColumnFamilyData* cfd = compact_->compaction->column_family_data();
+    auto prefix_extractor =
+        compact_->compaction->mutable_cf_options()->prefix_extractor.get();
+    std::atomic<size_t> next_file_meta_idx(0);
+    auto verify_table = [&](Status& output_status) {
+      while (true) {
+        size_t file_idx = next_file_meta_idx.fetch_add(1);
+        if (file_idx >= files_meta.size()) {
+          break;
+        }
+        // Verify that the table is usable
+        // We set for_compaction to false and don't OptimizeForCompactionTableRead
+        // here because this is a special case after we finish the table building
+        // No matter whether use_direct_io_for_flush_and_compaction is true,
+        // we will regard this verification as user reads since the goal is
+        // to cache it here for further user reads
+        InternalIterator* iter = cfd->table_cache()->NewIterator(
+            ReadOptions(), env_options_, cfd->internal_comparator(),
+            files_meta[file_idx]->fd, nullptr /* range_del_agg */,
+            prefix_extractor, nullptr,
+            cfd->internal_stats()->GetFileReadHist(
+                compact_->compaction->output_level()),
+            false, nullptr /* arena */, false /* skip_filters */,
+            compact_->compaction->output_level());
+        auto s = iter->status();
+
+        if (s.ok() && paranoid_file_checks_) {
+          for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {}
+          s = iter->status();
+        }
+
+        delete iter;
+
+        if (!s.ok()) {
+          output_status = s;
+          break;
+        }
+      }
+    };
+    for (size_t i = 1; i < compact_->sub_compact_states.size(); i++) {
+      thread_pool.emplace_back(verify_table,
+                               std::ref(compact_->sub_compact_states[i].status));
+    }
+    verify_table(compact_->sub_compact_states[0].status);
+    for (auto& thread : thread_pool) {
+      thread.join();
+    }
+    for (const auto& state : compact_->sub_compact_states) {
+      if (!state.status.ok()) {
+        status = state.status;
+        break;
+      }
     }
   }
 
@@ -766,8 +832,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (bottommost_level_ && kSampleBytes > 0) {
     const size_t kMaxSamples = kSampleBytes >> kSampleLenShift;
     const size_t kOutFileLen =
-        static_cast<size_t>(mutable_cf_options->MaxFileSizeForLevel(
-            compact_->compaction->output_level()));
+        static_cast<size_t>(MaxFileSizeForLevel(*mutable_cf_options,
+            compact_->compaction->output_level(),
+            cfd->ioptions()->compaction_style,
+            compact_->compaction->GetInputBaseLevel(),
+            cfd->ioptions()->level_compaction_dynamic_level_bytes));
     if (kOutFileLen != port::kMaxSizet) {
       const size_t kOutFileNumSamples = kOutFileLen >> kSampleLenShift;
       Random64 generator{versions_->NewFileNumber()};
@@ -810,9 +879,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   sub_compact->c_iter.reset(new CompactionIterator(
       input.get(), cfd->user_comparator(), &merge, versions_->LastSequence(),
       &existing_snapshots_, earliest_write_conflict_snapshot_,
-      snapshot_checker_, env_, false, range_del_agg.get(),
-      sub_compact->compaction, compaction_filter, shutting_down_,
-      preserve_deletes_seqnum_));
+      snapshot_checker_, env_, ShouldReportDetailedTime(env_, stats_), false,
+      range_del_agg.get(), sub_compact->compaction, compaction_filter,
+      shutting_down_, preserve_deletes_seqnum_));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
   if (c_iter->Valid() && sub_compact->compaction->output_level() != 0) {
@@ -1169,41 +1238,16 @@ Status CompactionJob::FinishCompactionOutputFile(
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
   TableProperties tp;
   if (s.ok() && current_entries > 0) {
-    // Verify that the table is usable
-    // We set for_compaction to false and don't OptimizeForCompactionTableRead
-    // here because this is a special case after we finish the table building
-    // No matter whether use_direct_io_for_flush_and_compaction is true,
-    // we will regard this verification as user reads since the goal is
-    // to cache it here for further user reads
-    InternalIterator* iter = cfd->table_cache()->NewIterator(
-        ReadOptions(), env_options_, cfd->internal_comparator(), meta->fd,
-        nullptr /* range_del_agg */, nullptr,
-        cfd->internal_stats()->GetFileReadHist(
-            compact_->compaction->output_level()),
-        false, nullptr /* arena */, false /* skip_filters */,
-        compact_->compaction->output_level());
-    s = iter->status();
-
-    if (s.ok() && paranoid_file_checks_) {
-      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-      }
-      s = iter->status();
-    }
-
-    delete iter;
-
     // Output to event logger and fire events.
-    if (s.ok()) {
-      tp = sub_compact->builder->GetTableProperties();
-      sub_compact->current_output()->table_properties =
-          std::make_shared<TableProperties>(tp);
-      ROCKS_LOG_INFO(db_options_.info_log,
-                     "[%s] [JOB %d] Generated table #%" PRIu64 ": %" PRIu64
-                     " keys, %" PRIu64 " bytes%s",
-                     cfd->GetName().c_str(), job_id_, output_number,
-                     current_entries, current_bytes,
-                     meta->marked_for_compaction ? " (need compaction)" : "");
-    }
+    tp = sub_compact->builder->GetTableProperties();
+    sub_compact->current_output()->table_properties =
+        std::make_shared<TableProperties>(tp);
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] Generated table #%" PRIu64 ": %" PRIu64
+                   " keys, %" PRIu64 " bytes%s",
+                   cfd->GetName().c_str(), job_id_, output_number,
+                   current_entries, current_bytes,
+                   meta->marked_for_compaction ? " (need compaction)" : "");
   }
   std::string fname;
   FileDescriptor output_fd;
@@ -1380,9 +1424,10 @@ Status CompactionJob::OpenCompactionOutputFile(
   }
 
   sub_compact->builder.reset(NewTableBuilder(
-      *cfd->ioptions(), cfd->internal_comparator(),
-      cfd->int_tbl_prop_collector_factories(), cfd->GetID(), cfd->GetName(),
-      sub_compact->outfile.get(), sub_compact->compaction->output_compression(),
+      *cfd->ioptions(), *(sub_compact->compaction->mutable_cf_options()),
+      cfd->internal_comparator(), cfd->int_tbl_prop_collector_factories(),
+      cfd->GetID(), cfd->GetName(), sub_compact->outfile.get(),
+      sub_compact->compaction->output_compression(),
       cfd->ioptions()->compression_opts,
       sub_compact->compaction->output_level(), &sub_compact->compression_dict,
       skip_filters, output_file_creation_time));

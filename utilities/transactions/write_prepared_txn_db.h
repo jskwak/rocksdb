@@ -249,10 +249,6 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   void AddPrepared(uint64_t seq);
   // Remove the transaction with prepare sequence seq from the prepared list
   void RemovePrepared(const uint64_t seq, const size_t batch_cnt = 1);
-  // Rollback a prepared txn identified with prep_seq. rollback_seq is the seq
-  // with which the additional data is written to cancel the txn effect. It can
-  // be used to identify the snapshots that overlap with the rolled back txn.
-  void RollbackPrepared(uint64_t prep_seq, uint64_t rollback_seq);
   // Add the transaction with prepare sequence prepare_seq and commit sequence
   // commit_seq to the commit map. loop_cnt is to detect infinite loops.
   void AddCommitted(uint64_t prepare_seq, uint64_t commit_seq,
@@ -351,12 +347,15 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   // Struct to hold ownership of snapshot and read callback for cleanup.
   struct IteratorState;
 
-  std::map<uint32_t, const Comparator*>* GetCFComparatorMap() {
-    return cf_map_.load();
+  std::shared_ptr<std::map<uint32_t, const Comparator*>> GetCFComparatorMap() {
+    return cf_map_;
+  }
+  std::shared_ptr<std::map<uint32_t, ColumnFamilyHandle*>> GetCFHandleMap() {
+    return handle_map_;
   }
   void UpdateCFComparatorMap(
       const std::vector<ColumnFamilyHandle*>& handles) override;
-  void UpdateCFComparatorMap(const ColumnFamilyHandle* handle) override;
+  void UpdateCFComparatorMap(ColumnFamilyHandle* handle) override;
 
   virtual const Snapshot* GetSnapshot() override;
 
@@ -599,9 +598,12 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   mutable port::RWMutex commit_cache_mutex_;
   mutable port::RWMutex snapshots_mutex_;
   // A cache of the cf comparators
-  std::atomic<std::map<uint32_t, const Comparator*>*> cf_map_;
-  // GC of the object above
-  std::unique_ptr<std::map<uint32_t, const Comparator*>> cf_map_gc_;
+  // Thread safety: since it is a const it is safe to read it concurrently
+  std::shared_ptr<std::map<uint32_t, const Comparator*>> cf_map_;
+  // A cache of the cf handles
+  // Thread safety: since the handle is read-only object it is a const it is
+  // safe to read it concurrently
+  std::shared_ptr<std::map<uint32_t, ColumnFamilyHandle*>> handle_map_;
 };
 
 class WritePreparedTxnReadCallback : public ReadCallback {

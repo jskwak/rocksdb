@@ -230,25 +230,37 @@ Status WritePreparedTxnDB::Get(const ReadOptions& options,
 void WritePreparedTxnDB::UpdateCFComparatorMap(
     const std::vector<ColumnFamilyHandle*>& handles) {
   auto cf_map = new std::map<uint32_t, const Comparator*>();
+  auto handle_map = new std::map<uint32_t, ColumnFamilyHandle*>();
   for (auto h : handles) {
     auto id = h->GetID();
     const Comparator* comparator = h->GetComparator();
     (*cf_map)[id] = comparator;
+    if (id != 0) {
+      (*handle_map)[id] = h;
+    } else {
+      // The pointer to the default cf handle in the handles will be deleted.
+      // Use the pointer maintained by the db instead.
+      (*handle_map)[id] = DefaultColumnFamily();
+    }
   }
-  cf_map_.store(cf_map);
-  cf_map_gc_.reset(cf_map);
+  cf_map_.reset(cf_map);
+  handle_map_.reset(handle_map);
 }
 
-void WritePreparedTxnDB::UpdateCFComparatorMap(
-    const ColumnFamilyHandle* h) {
-  auto old_cf_map_ptr = cf_map_.load();
+void WritePreparedTxnDB::UpdateCFComparatorMap(ColumnFamilyHandle* h) {
+  auto old_cf_map_ptr = cf_map_.get();
   assert(old_cf_map_ptr);
   auto cf_map = new std::map<uint32_t, const Comparator*>(*old_cf_map_ptr);
+  auto old_handle_map_ptr = handle_map_.get();
+  assert(old_handle_map_ptr);
+  auto handle_map =
+      new std::map<uint32_t, ColumnFamilyHandle*>(*old_handle_map_ptr);
   auto id = h->GetID();
   const Comparator* comparator = h->GetComparator();
   (*cf_map)[id] = comparator;
-  cf_map_.store(cf_map);
-  cf_map_gc_.reset(cf_map);
+  (*handle_map)[id] = h;
+  cf_map_.reset(cf_map);
+  handle_map_.reset(handle_map);
 }
 
 
@@ -378,25 +390,6 @@ void WritePreparedTxnDB::AddPrepared(uint64_t seq) {
   }
   WriteLock wl(&prepared_mutex_);
   prepared_txns_.push(seq);
-}
-
-void WritePreparedTxnDB::RollbackPrepared(uint64_t prep_seq,
-                                          uint64_t /*rollback_seq*/) {
-  ROCKS_LOG_DETAILS(
-      info_log_, "Txn %" PRIu64 " rolling back with rollback seq of " PRIu64 "",
-      prep_seq, rollback_seq);
-  std::vector<SequenceNumber> snapshots =
-      GetSnapshotListFromDB(kMaxSequenceNumber);
-  // TODO(myabandeh): currently we are assuming that there is no snapshot taken
-  // when a transaciton is rolled back. This is the case the way MySQL does
-  // rollback which is after recovery. We should extend it to be able to
-  // rollback txns that overlap with exsiting snapshots.
-  assert(snapshots.size() == 0);
-  if (snapshots.size()) {
-    throw std::runtime_error(
-        "Rollback reqeust while there are live snapshots.");
-  }
-  RemovePrepared(prep_seq);
 }
 
 void WritePreparedTxnDB::AddCommitted(uint64_t prepare_seq, uint64_t commit_seq,

@@ -251,6 +251,7 @@ const SstFileMetaData* PickFileRandomly(
 }
 }  // anonymous namespace
 
+#ifndef ROCKSDB_VALGRIND_RUN
 // All the TEST_P tests run once with sub_compactions disabled (i.e.
 // options.max_subcompactions = 1) and once with it enabled
 TEST_P(DBCompactionTestWithParam, CompactionDeletionTrigger) {
@@ -293,6 +294,7 @@ TEST_P(DBCompactionTestWithParam, CompactionDeletionTrigger) {
     ASSERT_GT(db_size[0] / 3, db_size[1]);
   }
 }
+#endif  // ROCKSDB_VALGRIND_RUN
 
 TEST_P(DBCompactionTestWithParam, CompactionsPreserveDeletes) {
   //  For each options type we test following
@@ -3128,6 +3130,48 @@ TEST_P(DBCompactionTestWithParam, IntraL0CompactionDoesNotObsoleteDeletions) {
   ASSERT_TRUE(db_->Get(roptions, Key(0), &result).IsNotFound());
 }
 
+TEST_P(DBCompactionTestWithParam, FullCompactionInBottomPriThreadPool) {
+  const int kNumFilesTrigger = 3;
+  Env::Default()->SetBackgroundThreads(1, Env::Priority::BOTTOM);
+  for (bool use_universal_compaction : {false, true}) {
+    Options options = CurrentOptions();
+    if (use_universal_compaction) {
+      options.compaction_style = kCompactionStyleUniversal;
+    } else {
+      options.compaction_style = kCompactionStyleLevel;
+      options.level_compaction_dynamic_level_bytes = true;
+    }
+    options.num_levels = 4;
+    options.write_buffer_size = 100 << 10;     // 100KB
+    options.target_file_size_base = 32 << 10;  // 32KB
+    options.level0_file_num_compaction_trigger = kNumFilesTrigger;
+    // Trigger compaction if size amplification exceeds 110%
+    options.compaction_options_universal.max_size_amplification_percent = 110;
+    DestroyAndReopen(options);
+
+    int num_bottom_pri_compactions = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BGWorkBottomCompaction",
+        [&](void* /*arg*/) { ++num_bottom_pri_compactions; });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    Random rnd(301);
+    for (int num = 0; num < kNumFilesTrigger; num++) {
+      ASSERT_EQ(NumSortedRuns(), num);
+      int key_idx = 0;
+      GenerateNewFile(&rnd, &key_idx);
+    }
+    dbfull()->TEST_WaitForCompact();
+
+    ASSERT_EQ(1, num_bottom_pri_compactions);
+
+    // Verify that size amplification did occur
+    ASSERT_EQ(NumSortedRuns(), 1);
+    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+  }
+  Env::Default()->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+}
+
 TEST_F(DBCompactionTest, OptimizedDeletionObsoleting) {
   // Deletions can be dropped when compacted to non-last level if they fall
   // outside the lower-level files' key-ranges.
@@ -3660,6 +3704,68 @@ TEST_F(DBCompactionTest, CompactionStatsTest) {
   VerifyCompactionStats(*cfd, *collector);
 }
 
+TEST_F(DBCompactionTest, CompactFilesOutputRangeConflict) {
+  // LSM setup:
+  // L1:      [ba bz]
+  // L2: [a b]       [c d]
+  // L3: [a b]       [c d]
+  //
+  // Thread 1:                        Thread 2:
+  // Begin compacting all L2->L3
+  //                                  Compact [ba bz] L1->L3
+  // End compacting all L2->L3
+  //
+  // The compaction operation in thread 2 should be disallowed because the range
+  // overlaps with the compaction in thread 1, which also covers that range in
+  // L3.
+  Options options = CurrentOptions();
+  FlushedFileCollector* collector = new FlushedFileCollector();
+  options.listeners.emplace_back(collector);
+  Reopen(options);
+
+  for (int level = 3; level >= 2; --level) {
+    ASSERT_OK(Put("a", "val"));
+    ASSERT_OK(Put("b", "val"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("c", "val"));
+    ASSERT_OK(Put("d", "val"));
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(level);
+  }
+  ASSERT_OK(Put("ba", "val"));
+  ASSERT_OK(Put("bz", "val"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"CompactFilesImpl:0",
+       "DBCompactionTest::CompactFilesOutputRangeConflict:Thread2Begin"},
+      {"DBCompactionTest::CompactFilesOutputRangeConflict:Thread2End",
+       "CompactFilesImpl:1"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto bg_thread = port::Thread([&]() {
+    // Thread 1
+    std::vector<std::string> filenames = collector->GetFlushedFiles();
+    filenames.pop_back();
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), filenames,
+                                3 /* output_level */));
+  });
+
+  // Thread 2
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CompactFilesOutputRangeConflict:Thread2Begin");
+  std::string filename = collector->GetFlushedFiles().back();
+  ASSERT_FALSE(
+      db_->CompactFiles(CompactionOptions(), {filename}, 3 /* output_level */)
+          .ok());
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CompactFilesOutputRangeConflict:Thread2End");
+
+  bg_thread.join();
+}
+
 INSTANTIATE_TEST_CASE_P(DBCompactionTestWithParam, DBCompactionTestWithParam,
                         ::testing::Values(std::make_tuple(1, true),
                                           std::make_tuple(1, false),
@@ -3679,7 +3785,7 @@ TEST_P(DBCompactionDirectIOTest, DirectIO) {
       "TableCache::NewIterator:for_compaction", [&](void* arg) {
         bool* use_direct_reads = static_cast<bool*>(arg);
         ASSERT_EQ(*use_direct_reads,
-                  options.use_direct_io_for_flush_and_compaction);
+                  options.use_direct_reads);
       });
   SyncPoint::GetInstance()->SetCallBack(
       "CompactionJob::OpenCompactionOutputFile", [&](void* arg) {
@@ -3698,7 +3804,7 @@ TEST_P(DBCompactionDirectIOTest, DirectIO) {
   MakeTables(3, "p", "q", 1);
   ASSERT_EQ("1,1,1", FilesPerLevel(1));
   Compact(1, "p1", "p9");
-  ASSERT_FALSE(readahead ^ options.use_direct_io_for_flush_and_compaction);
+  ASSERT_EQ(readahead, options.use_direct_reads);
   ASSERT_EQ("0,0,1", FilesPerLevel(1));
   Destroy(options);
   delete options.env;

@@ -2296,7 +2296,8 @@ TEST_F(DBTest2, RateLimitedCompactionReads) {
                              kBytesPerKey) /* rate_bytes_per_sec */,
         10 * 1000 /* refill_period_us */, 10 /* fairness */,
         RateLimiter::Mode::kReadsOnly));
-    options.use_direct_io_for_flush_and_compaction = use_direct_io;
+    options.use_direct_reads = options.use_direct_io_for_flush_and_compaction =
+        use_direct_io;
     BlockBasedTableOptions bbto;
     bbto.block_size = 16384;
     bbto.no_block_cache = true;
@@ -2318,7 +2319,7 @@ TEST_F(DBTest2, RateLimitedCompactionReads) {
     // chose 1MB as the upper bound on the total bytes read.
     size_t rate_limited_bytes =
         options.rate_limiter->GetTotalBytesThrough(Env::IO_LOW);
-    // Include the explict prefetch of the footer in direct I/O case.
+    // Include the explicit prefetch of the footer in direct I/O case.
     size_t direct_io_extra = use_direct_io ? 512 * 1024 : 0;
     ASSERT_GE(rate_limited_bytes,
               static_cast<size_t>(kNumKeysPerFile * kBytesPerKey * kNumL0Files +
@@ -2500,6 +2501,27 @@ TEST_F(DBTest2, LiveFilesOmitObsoleteFiles) {
 }
 
 #endif  // ROCKSDB_LITE
+
+TEST_F(DBTest2, PinnableSliceAndMmapReads) {
+  Options options = CurrentOptions();
+  options.allow_mmap_reads = true;
+  Reopen(options);
+
+  ASSERT_OK(Put("foo", "bar"));
+  ASSERT_OK(Flush());
+
+  PinnableSlice pinned_value;
+  ASSERT_EQ(Get("foo", &pinned_value), Status::OK());
+  ASSERT_EQ(pinned_value.ToString(), "bar");
+
+  dbfull()->TEST_CompactRange(0 /* level */, nullptr /* begin */,
+                              nullptr /* end */, nullptr /* column_family */,
+                              true /* disallow_trivial_move */);
+
+  // Ensure pinned_value doesn't rely on memory munmap'd by the above
+  // compaction.
+  ASSERT_EQ(pinned_value.ToString(), "bar");
+}
 
 }  // namespace rocksdb
 

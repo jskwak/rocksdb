@@ -773,9 +773,9 @@ Slice BlobDBImpl::GetCompressedSlice(const Slice& raw,
   }
   StopWatch compression_sw(env_, statistics_, BLOB_DB_COMPRESSION_MICROS);
   CompressionType ct = bdb_options_.compression;
-  CompressionOptions compression_opts;
-  CompressBlock(raw, compression_opts, &ct, kBlockBasedTableVersionFormat,
-                Slice(), compression_output);
+  CompressionContext compression_ctx(ct);
+  CompressBlock(raw, compression_ctx, &ct, kBlockBasedTableVersionFormat,
+                compression_output);
   return *compression_output;
 }
 
@@ -1068,7 +1068,7 @@ Status BlobDBImpl::GetBlobValue(const Slice& key, const Slice& index_entry,
                     "Failed to read blob from blob file %" PRIu64
                     ", blob_offset: %" PRIu64 ", blob_size: %" PRIu64
                     ", key_size: " PRIu64 ", read " PRIu64
-                    "bytes, status: '%s'",
+                    " bytes, status: '%s'",
                     bfile->BlobFileNumber(), blob_index.offset(),
                     blob_index.size(), key.size(), s.ToString().c_str());
     return s;
@@ -1078,7 +1078,7 @@ Status BlobDBImpl::GetBlobValue(const Slice& key, const Slice& index_entry,
                     "Failed to read blob from blob file %" PRIu64
                     ", blob_offset: %" PRIu64 ", blob_size: %" PRIu64
                     ", key_size: " PRIu64 ", read " PRIu64
-                    "bytes, status: '%s'",
+                    " bytes, status: '%s'",
                     bfile->BlobFileNumber(), blob_index.offset(),
                     blob_index.size(), key.size(), s.ToString().c_str());
 
@@ -1120,10 +1120,10 @@ Status BlobDBImpl::GetBlobValue(const Slice& key, const Slice& index_entry,
     {
       StopWatch decompression_sw(env_, statistics_,
                                  BLOB_DB_DECOMPRESSION_MICROS);
+      UncompressionContext uncompression_ctx(bfile->compression());
       s = UncompressBlockContentsForCompressionType(
-          blob_value.data(), blob_value.size(), &contents,
-          kBlockBasedTableVersionFormat, Slice(), bfile->compression(),
-          *(cfh->cfd()->ioptions()));
+          uncompression_ctx, blob_value.data(), blob_value.size(), &contents,
+          kBlockBasedTableVersionFormat, *(cfh->cfd()->ioptions()));
     }
     value->PinSelf(contents.data);
   }
@@ -1434,7 +1434,7 @@ Status BlobDBImpl::GCFileAndUpdateLSM(const std::shared_ptr<BlobFile>& bfptr,
   uint64_t now = EpochNow();
 
   std::shared_ptr<Reader> reader =
-      bfptr->OpenSequentialReader(env_, db_options_, env_options_);
+      bfptr->OpenRandomAccessReader(env_, db_options_, env_options_);
   if (!reader) {
     ROCKS_LOG_ERROR(db_options_.info_log,
                     "File sequential reader could not be opened",

@@ -106,14 +106,14 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     result.db_paths.emplace_back(dbname, std::numeric_limits<uint64_t>::max());
   }
 
-  if (result.use_direct_io_for_flush_and_compaction &&
+  if (result.use_direct_reads &&
       result.compaction_readahead_size == 0) {
     TEST_SYNC_POINT_CALLBACK("SanitizeOptions:direct_io", nullptr);
     result.compaction_readahead_size = 1024 * 1024 * 2;
   }
 
   if (result.compaction_readahead_size > 0 ||
-      result.use_direct_io_for_flush_and_compaction) {
+      result.use_direct_reads) {
     result.new_table_reader_for_compaction_inputs = true;
   }
 
@@ -532,11 +532,11 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
   bool flushed = false;
   uint64_t corrupted_log_number = kMaxSequenceNumber;
   for (auto log_number : log_numbers) {
-    if (log_number <= versions_->latest_deleted_log_number()) {
+    if (log_number < versions_->min_log_number_to_keep_2pc()) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "Skipping log #%" PRIu64
-                     " since it is not newer than latest deleted log #%" PRIu64,
-                     log_number, versions_->latest_deleted_log_number());
+                     " since it is older than min log to keep #%" PRIu64,
+                     log_number, versions_->min_log_number_to_keep_2pc());
       continue;
     }
     // The previous incarnation may not have written any MANIFEST
@@ -577,7 +577,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
           continue;
         }
       }
-      file_reader.reset(new SequentialFileReader(std::move(file)));
+      file_reader.reset(new SequentialFileReader(std::move(file), fname));
     }
 
     // Create the log reader.
@@ -1090,7 +1090,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
             new_log_number,
             new log::Writer(
                 std::move(file_writer), new_log_number,
-                impl->immutable_db_options_.recycle_log_file_num > 0));
+                impl->immutable_db_options_.recycle_log_file_num > 0,
+                impl->immutable_db_options_.manual_wal_flush));
       }
 
       // set column family handles
@@ -1217,6 +1218,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   if (s.ok()) {
     ROCKS_LOG_INFO(impl->immutable_db_options_.info_log, "DB pointer %p", impl);
     LogFlush(impl->immutable_db_options_.info_log);
+    assert(impl->TEST_WALBufferIsEmpty());
+    // If the assert above fails then we need to FlushWAL before returning
+    // control back to the user.
     if (!persist_options_status.ok()) {
       s = Status::IOError(
           "DB::Open() failed --- Unable to persist Options file",

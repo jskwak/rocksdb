@@ -183,7 +183,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       last_stats_dump_time_microsec_(0),
       next_job_id_(1),
       has_unpersisted_data_(false),
-      unable_to_flush_oldest_log_(false),
+      unable_to_release_oldest_log_(false),
       env_options_(BuildDBOptions(immutable_db_options_, mutable_db_options_)),
       env_options_for_compaction_(env_->OptimizeForCompactionTableWrite(
           env_options_, immutable_db_options_)),
@@ -718,6 +718,11 @@ Status DBImpl::FlushWAL(bool sync) {
     if (!s.ok()) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log, "WAL flush error %s",
                       s.ToString().c_str());
+      // In case there is a fs error we should set it globally to prevent the
+      // future writes
+      WriteStatusCheck(s);
+      // whether sync or not, we should abort the rest of function upon error
+      return s;
     }
     if (!sync) {
       ROCKS_LOG_DEBUG(immutable_db_options_.info_log, "FlushWAL sync=false");
@@ -805,6 +810,8 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
     assert(log.getting_synced);
     if (status.ok() && logs_.size() > 1) {
       logs_to_free_.push_back(log.ReleaseWriter());
+      // To modify logs_ both mutex_ and log_write_mutex_ must be held
+      InstrumentedMutexLock l(&log_write_mutex_);
       it = logs_.erase(it);
     } else {
       log.getting_synced = false;
@@ -871,13 +878,14 @@ void DBImpl::BackgroundCallPurge() {
     if (!purge_queue_.empty()) {
       auto purge_file = purge_queue_.begin();
       auto fname = purge_file->fname;
+      auto dir_to_sync = purge_file->dir_to_sync;
       auto type = purge_file->type;
       auto number = purge_file->number;
       auto job_id = purge_file->job_id;
       purge_queue_.pop_front();
 
       mutex_.Unlock();
-      DeleteObsoleteFileImpl(job_id, fname, type, number);
+      DeleteObsoleteFileImpl(job_id, fname, dir_to_sync, type, number);
       mutex_.Lock();
     } else {
       assert(!logs_to_free_queue_.empty());
@@ -961,7 +969,7 @@ InternalIterator* DBImpl::NewInternalIterator(
   MergeIteratorBuilder merge_iter_builder(
       &cfd->internal_comparator(), arena,
       !read_options.total_order_seek &&
-          cfd->ioptions()->prefix_extractor != nullptr);
+          super_version->mutable_cf_options.prefix_extractor != nullptr);
   // Collect iterator for mutable mem
   merge_iter_builder.AddIterator(
       super_version->mem->NewIterator(read_options, arena));
@@ -1164,6 +1172,7 @@ std::vector<Status> DBImpl::MultiGet(
   // First look in the memtable, then in the immutable memtable (if any).
   // s is both in/out. When in, s could either be OK or MergeInProgress.
   // merge_operands will contain the sequence of merges in the latter case.
+  size_t num_found = 0;
   for (size_t i = 0; i < num_keys; ++i) {
     merge_context.Clear();
     Status& s = stat_list[i];
@@ -1185,11 +1194,11 @@ std::vector<Status> DBImpl::MultiGet(
       if (super_version->mem->Get(lkey, value, &s, &merge_context,
                                   &range_del_agg, read_options)) {
         done = true;
-        // TODO(?): RecordTick(stats_, MEMTABLE_HIT)?
+        RecordTick(stats_, MEMTABLE_HIT);
       } else if (super_version->imm->Get(lkey, value, &s, &merge_context,
                                          &range_del_agg, read_options)) {
         done = true;
-        // TODO(?): RecordTick(stats_, MEMTABLE_HIT)?
+        RecordTick(stats_, MEMTABLE_HIT);
       }
     }
     if (!done) {
@@ -1198,11 +1207,12 @@ std::vector<Status> DBImpl::MultiGet(
       super_version->current->Get(read_options, lkey, &pinnable_val, &s,
                                   &merge_context, &range_del_agg);
       value->assign(pinnable_val.data(), pinnable_val.size());
-      // TODO(?): RecordTick(stats_, MEMTABLE_MISS)?
+      RecordTick(stats_, MEMTABLE_MISS);
     }
 
     if (s.ok()) {
       bytes_read += value->size();
+      num_found++;
     }
   }
 
@@ -1230,6 +1240,7 @@ std::vector<Status> DBImpl::MultiGet(
 
   RecordTick(stats_, NUMBER_MULTIGET_CALLS);
   RecordTick(stats_, NUMBER_MULTIGET_KEYS_READ, num_keys);
+  RecordTick(stats_, NUMBER_MULTIGET_KEYS_FOUND, num_found);
   RecordTick(stats_, NUMBER_MULTIGET_BYTES_READ, bytes_read);
   MeasureTime(stats_, BYTES_PER_MULTIGET, bytes_read);
   PERF_COUNTER_ADD(multiget_read_bytes, bytes_read);
@@ -1557,11 +1568,11 @@ Iterator* DBImpl::NewIterator(const ReadOptions& read_options,
 #else
     SuperVersion* sv = cfd->GetReferencedSuperVersion(&mutex_);
     auto iter = new ForwardIterator(this, read_options, cfd, sv);
-    result =
-        NewDBIterator(env_, read_options, *cfd->ioptions(),
-                      cfd->user_comparator(), iter, kMaxSequenceNumber,
-                      sv->mutable_cf_options.max_sequential_skip_in_iterations,
-                      read_callback);
+    result = NewDBIterator(
+        env_, read_options, *cfd->ioptions(), sv->mutable_cf_options,
+        cfd->user_comparator(), iter, kMaxSequenceNumber,
+        sv->mutable_cf_options.max_sequential_skip_in_iterations,
+        read_callback);
 #endif
   } else {
     // Note: no need to consider the special case of
@@ -1626,7 +1637,7 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(const ReadOptions& read_options,
   // likely that any iterator pointer is close to the iterator it points to so
   // that they are likely to be in the same cache line and/or page.
   ArenaWrappedDBIter* db_iter = NewArenaWrappedDbIterator(
-      env_, read_options, *cfd->ioptions(), snapshot,
+      env_, read_options, *cfd->ioptions(), sv->mutable_cf_options, snapshot,
       sv->mutable_cf_options.max_sequential_skip_in_iterations,
       sv->version_number, read_callback,
       ((read_options.snapshot != nullptr) ? nullptr : this), cfd, allow_blob,
@@ -1677,8 +1688,8 @@ Status DBImpl::NewIterators(
       SuperVersion* sv = cfd->GetReferencedSuperVersion(&mutex_);
       auto iter = new ForwardIterator(this, read_options, cfd, sv);
       iterators->push_back(NewDBIterator(
-          env_, read_options, *cfd->ioptions(), cfd->user_comparator(), iter,
-          kMaxSequenceNumber,
+          env_, read_options, *cfd->ioptions(), sv->mutable_cf_options,
+          cfd->user_comparator(), iter, kMaxSequenceNumber,
           sv->mutable_cf_options.max_sequential_skip_in_iterations,
           read_callback));
     }
@@ -1834,6 +1845,13 @@ bool DBImpl::GetProperty(ColumnFamilyHandle* column_family,
     InstrumentedMutexLock l(&mutex_);
     return cfd->internal_stats()->GetStringProperty(*property_info, property,
                                                     value);
+  } else if (property_info->handle_string_dbimpl) {
+    std::string tmp_value;
+    bool ret_value = (this->*(property_info->handle_string_dbimpl))(&tmp_value);
+    if (ret_value) {
+      *value = tmp_value;
+    }
+    return ret_value;
   }
   // Shouldn't reach here since exactly one of handle_string and handle_int
   // should be non-nullptr.
@@ -1898,6 +1916,16 @@ bool DBImpl::GetIntPropertyInternal(ColumnFamilyData* cfd,
 
     return ret;
   }
+}
+
+bool DBImpl::GetPropertyHandleOptionsStatistics(std::string* value) {
+  assert(value != nullptr);
+  Statistics* statistics = immutable_db_options_.statistics.get();
+  if (!statistics) {
+    return false;
+  }
+  *value = statistics->ToString();
+  return true;
 }
 
 #ifndef ROCKSDB_LITE
@@ -2084,6 +2112,7 @@ void DBImpl::ReleaseFileNumberFromPendingOutputs(
 Status DBImpl::GetUpdatesSince(
     SequenceNumber seq, unique_ptr<TransactionLogIterator>* iter,
     const TransactionLogIterator::ReadOptions& read_options) {
+
   RecordTick(stats_, GET_UPDATES_SINCE_CALLS);
   if (seq > versions_->LastSequence()) {
     return Status::NotFound("Requested sequence not yet written in the db");
@@ -2339,7 +2368,8 @@ Status DBImpl::GetDbIdentity(std::string& identity) const {
     if (!s.ok()) {
       return s;
     }
-    id_file_reader.reset(new SequentialFileReader(std::move(idfile)));
+    id_file_reader.reset(
+        new SequentialFileReader(std::move(idfile), idfilename));
   }
 
   uint64_t file_size;
@@ -2432,15 +2462,15 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     uint64_t number;
     FileType type;
     InfoLogPrefix info_log_prefix(!soptions.db_log_dir.empty(), dbname);
-    for (size_t i = 0; i < filenames.size(); i++) {
-      if (ParseFileName(filenames[i], &number, info_log_prefix.prefix, &type) &&
-          type != kDBLockFile) {  // Lock file will be deleted at end
+    for (const auto& fname : filenames) {
+      if (ParseFileName(fname, &number, info_log_prefix.prefix, &type) &&
+        type != kDBLockFile) {  // Lock file will be deleted at end
         Status del;
-        std::string path_to_delete = dbname + "/" + filenames[i];
+        std::string path_to_delete = dbname + "/" + fname;
         if (type == kMetaDatabase) {
           del = DestroyDB(path_to_delete, options);
         } else if (type == kTableFile) {
-          del = DeleteSSTFile(&soptions, path_to_delete);
+          del = DeleteSSTFile(&soptions, path_to_delete, dbname);
         } else {
           del = env->DeleteFile(path_to_delete);
         }
@@ -2452,13 +2482,12 @@ Status DestroyDB(const std::string& dbname, const Options& options,
 
     std::vector<std::string> paths;
 
-    for (size_t path_id = 0; path_id < options.db_paths.size(); path_id++) {
-      paths.emplace_back(options.db_paths[path_id].path);
+    for (const auto& path : options.db_paths) {
+      paths.emplace_back(path.path);
     }
-    for (auto& cf : column_families) {
-      for (size_t path_id = 0; path_id < cf.options.cf_paths.size();
-           path_id++) {
-        paths.emplace_back(cf.options.cf_paths[path_id].path);
+    for (const auto& cf : column_families) {
+      for (const auto& path : cf.options.cf_paths) {
+        paths.emplace_back(path.path);
       }
     }
 
@@ -2469,56 +2498,64 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     std::sort(paths.begin(), paths.end());
     paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
 
-    for (auto& path : paths) {
-      env->GetChildren(path, &filenames);
-      for (size_t i = 0; i < filenames.size(); i++) {
-        if (ParseFileName(filenames[i], &number, &type) &&
+    for (const auto& path : paths) {
+      if (env->GetChildren(path, &filenames).ok()) {
+        for (const auto& fname : filenames) {
+          if (ParseFileName(fname, &number, &type) &&
             type == kTableFile) {  // Lock file will be deleted at end
-          std::string table_path = path + "/" + filenames[i];
-          Status del = DeleteSSTFile(&soptions, table_path);
-          if (result.ok() && !del.ok()) {
-            result = del;
+            std::string table_path = path + "/" + fname;
+            Status del = DeleteSSTFile(&soptions, table_path, dbname);
+            if (result.ok() && !del.ok()) {
+              result = del;
+            }
           }
         }
+        env->DeleteDir(path);
       }
     }
 
     std::vector<std::string> walDirFiles;
     std::string archivedir = ArchivalDirectory(dbname);
+    bool wal_dir_exists = false;
     if (dbname != soptions.wal_dir) {
-      env->GetChildren(soptions.wal_dir, &walDirFiles);
+      wal_dir_exists = env->GetChildren(soptions.wal_dir, &walDirFiles).ok();
       archivedir = ArchivalDirectory(soptions.wal_dir);
     }
 
-    // Delete log files in the WAL dir
-    for (const auto& file : walDirFiles) {
-      if (ParseFileName(file, &number, &type) && type == kLogFile) {
-        Status del = env->DeleteFile(LogFileName(soptions.wal_dir, number));
-        if (result.ok() && !del.ok()) {
-          result = del;
-        }
-      }
-    }
-
+    // Archive dir may be inside wal dir or dbname and should be
+    // processed and removed before those otherwise we have issues
+    // removing them
     std::vector<std::string> archiveFiles;
-    env->GetChildren(archivedir, &archiveFiles);
-    // Delete archival files.
-    for (size_t i = 0; i < archiveFiles.size(); ++i) {
-      if (ParseFileName(archiveFiles[i], &number, &type) && type == kLogFile) {
-        Status del = env->DeleteFile(archivedir + "/" + archiveFiles[i]);
-        if (result.ok() && !del.ok()) {
-          result = del;
+    if (env->GetChildren(archivedir, &archiveFiles).ok()) {
+      // Delete archival files.
+      for (const auto& file : archiveFiles) {
+        if (ParseFileName(file, &number, &type) &&
+          type == kLogFile) {
+          Status del = env->DeleteFile(archivedir + "/" + file);
+          if (result.ok() && !del.ok()) {
+            result = del;
+          }
         }
       }
+      env->DeleteDir(archivedir);
     }
 
-    // ignore case where no archival directory is present
-    env->DeleteDir(archivedir);
+    // Delete log files in the WAL dir
+    if (wal_dir_exists) {
+      for (const auto& file : walDirFiles) {
+        if (ParseFileName(file, &number, &type) && type == kLogFile) {
+          Status del = env->DeleteFile(LogFileName(soptions.wal_dir, number));
+          if (result.ok() && !del.ok()) {
+            result = del;
+          }
+        }
+      }
+      env->DeleteDir(soptions.wal_dir);
+    }
 
     env->UnlockFile(lock);  // Ignore error since state is already gone
     env->DeleteFile(lockname);
     env->DeleteDir(dbname);  // Ignore error in case dir contains other files
-    env->DeleteDir(soptions.wal_dir);
   }
   return result;
 }
@@ -2844,7 +2881,9 @@ Status DBImpl::IngestExternalFile(
     pending_output_elem = CaptureCurrentFileNumberInPendingOutputs();
   }
 
-  status = ingestion_job.Prepare(external_files);
+  SuperVersion* super_version = cfd->GetReferencedSuperVersion(&mutex_);
+  status = ingestion_job.Prepare(external_files, super_version);
+  CleanupSuperVersion(super_version);
   if (!status.ok()) {
     return status;
   }
@@ -3016,5 +3055,4 @@ void DBImpl::WaitForIngestFile() {
 }
 
 #endif  // ROCKSDB_LITE
-
 }  // namespace rocksdb

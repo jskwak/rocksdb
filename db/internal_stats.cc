@@ -18,9 +18,10 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "db/column_family.h"
 
+#include "db/column_family.h"
 #include "db/db_impl.h"
+#include "table/block_based_table_factory.h"
 #include "util/string_util.h"
 
 namespace rocksdb {
@@ -229,8 +230,8 @@ static const std::string num_live_versions = "num-live-versions";
 static const std::string current_version_number =
     "current-super-version-number";
 static const std::string estimate_live_data_size = "estimate-live-data-size";
-static const std::string min_log_number_to_keep = "min-log-number-to-keep";
-static const std::string base_level = "base-level";
+static const std::string min_log_number_to_keep_str = "min-log-number-to-keep";
+static const std::string base_level_str = "base-level";
 static const std::string total_sst_files_size = "total-sst-files-size";
 static const std::string live_sst_files_size = "live-sst-files-size";
 static const std::string estimate_pending_comp_bytes =
@@ -245,6 +246,10 @@ static const std::string actual_delayed_write_rate =
     "actual-delayed-write-rate";
 static const std::string is_write_stopped = "is-write-stopped";
 static const std::string estimate_oldest_key_time = "estimate-oldest-key-time";
+static const std::string block_cache_capacity = "block-cache-capacity";
+static const std::string block_cache_usage = "block-cache-usage";
+static const std::string block_cache_pinned_usage = "block-cache-pinned-usage";
+static const std::string options_statistics = "options-statistics";
 
 const std::string DB::Properties::kNumFilesAtLevelPrefix =
     rocksdb_prefix + num_files_at_level_prefix;
@@ -304,12 +309,12 @@ const std::string DB::Properties::kCurrentSuperVersionNumber =
 const std::string DB::Properties::kEstimateLiveDataSize =
     rocksdb_prefix + estimate_live_data_size;
 const std::string DB::Properties::kMinLogNumberToKeep =
-    rocksdb_prefix + min_log_number_to_keep;
+    rocksdb_prefix + min_log_number_to_keep_str;
 const std::string DB::Properties::kTotalSstFilesSize =
     rocksdb_prefix + total_sst_files_size;
 const std::string DB::Properties::kLiveSstFilesSize =
     rocksdb_prefix + live_sst_files_size;
-const std::string DB::Properties::kBaseLevel = rocksdb_prefix + base_level;
+const std::string DB::Properties::kBaseLevel = rocksdb_prefix + base_level_str;
 const std::string DB::Properties::kEstimatePendingCompactionBytes =
     rocksdb_prefix + estimate_pending_comp_bytes;
 const std::string DB::Properties::kAggregatedTableProperties =
@@ -322,109 +327,147 @@ const std::string DB::Properties::kIsWriteStopped =
     rocksdb_prefix + is_write_stopped;
 const std::string DB::Properties::kEstimateOldestKeyTime =
     rocksdb_prefix + estimate_oldest_key_time;
+const std::string DB::Properties::kBlockCacheCapacity =
+    rocksdb_prefix + block_cache_capacity;
+const std::string DB::Properties::kBlockCacheUsage =
+    rocksdb_prefix + block_cache_usage;
+const std::string DB::Properties::kBlockCachePinnedUsage =
+    rocksdb_prefix + block_cache_pinned_usage;
+const std::string DB::Properties::kOptionsStatistics =
+    rocksdb_prefix + options_statistics;
 
 const std::unordered_map<std::string, DBPropertyInfo>
     InternalStats::ppt_name_to_info = {
         {DB::Properties::kNumFilesAtLevelPrefix,
-         {false, &InternalStats::HandleNumFilesAtLevel, nullptr, nullptr}},
+         {false, &InternalStats::HandleNumFilesAtLevel, nullptr, nullptr,
+          nullptr}},
         {DB::Properties::kCompressionRatioAtLevelPrefix,
          {false, &InternalStats::HandleCompressionRatioAtLevelPrefix, nullptr,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kLevelStats,
-         {false, &InternalStats::HandleLevelStats, nullptr, nullptr}},
+         {false, &InternalStats::HandleLevelStats, nullptr, nullptr, nullptr}},
         {DB::Properties::kStats,
-         {false, &InternalStats::HandleStats, nullptr, nullptr}},
+         {false, &InternalStats::HandleStats, nullptr, nullptr, nullptr}},
         {DB::Properties::kCFStats,
          {false, &InternalStats::HandleCFStats, nullptr,
-          &InternalStats::HandleCFMapStats}},
+          &InternalStats::HandleCFMapStats, nullptr}},
         {DB::Properties::kCFStatsNoFileHistogram,
-         {false, &InternalStats::HandleCFStatsNoFileHistogram, nullptr,
+         {false, &InternalStats::HandleCFStatsNoFileHistogram, nullptr, nullptr,
           nullptr}},
         {DB::Properties::kCFFileHistogram,
-         {false, &InternalStats::HandleCFFileHistogram, nullptr, nullptr}},
+         {false, &InternalStats::HandleCFFileHistogram, nullptr, nullptr,
+          nullptr}},
         {DB::Properties::kDBStats,
-         {false, &InternalStats::HandleDBStats, nullptr, nullptr}},
+         {false, &InternalStats::HandleDBStats, nullptr, nullptr, nullptr}},
         {DB::Properties::kSSTables,
-         {false, &InternalStats::HandleSsTables, nullptr, nullptr}},
+         {false, &InternalStats::HandleSsTables, nullptr, nullptr, nullptr}},
         {DB::Properties::kAggregatedTableProperties,
          {false, &InternalStats::HandleAggregatedTableProperties, nullptr,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kAggregatedTablePropertiesAtLevel,
          {false, &InternalStats::HandleAggregatedTablePropertiesAtLevel,
-          nullptr, nullptr}},
+          nullptr, nullptr, nullptr}},
         {DB::Properties::kNumImmutableMemTable,
-         {false, nullptr, &InternalStats::HandleNumImmutableMemTable, nullptr}},
+         {false, nullptr, &InternalStats::HandleNumImmutableMemTable, nullptr,
+          nullptr}},
         {DB::Properties::kNumImmutableMemTableFlushed,
          {false, nullptr, &InternalStats::HandleNumImmutableMemTableFlushed,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kMemTableFlushPending,
-         {false, nullptr, &InternalStats::HandleMemTableFlushPending, nullptr}},
+         {false, nullptr, &InternalStats::HandleMemTableFlushPending, nullptr,
+          nullptr}},
         {DB::Properties::kCompactionPending,
-         {false, nullptr, &InternalStats::HandleCompactionPending, nullptr}},
+         {false, nullptr, &InternalStats::HandleCompactionPending, nullptr,
+          nullptr}},
         {DB::Properties::kBackgroundErrors,
-         {false, nullptr, &InternalStats::HandleBackgroundErrors, nullptr}},
+         {false, nullptr, &InternalStats::HandleBackgroundErrors, nullptr,
+          nullptr}},
         {DB::Properties::kCurSizeActiveMemTable,
-         {false, nullptr, &InternalStats::HandleCurSizeActiveMemTable,
+         {false, nullptr, &InternalStats::HandleCurSizeActiveMemTable, nullptr,
           nullptr}},
         {DB::Properties::kCurSizeAllMemTables,
-         {false, nullptr, &InternalStats::HandleCurSizeAllMemTables, nullptr}},
+         {false, nullptr, &InternalStats::HandleCurSizeAllMemTables, nullptr,
+          nullptr}},
         {DB::Properties::kSizeAllMemTables,
-         {false, nullptr, &InternalStats::HandleSizeAllMemTables, nullptr}},
+         {false, nullptr, &InternalStats::HandleSizeAllMemTables, nullptr,
+          nullptr}},
         {DB::Properties::kNumEntriesActiveMemTable,
          {false, nullptr, &InternalStats::HandleNumEntriesActiveMemTable,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kNumEntriesImmMemTables,
-         {false, nullptr, &InternalStats::HandleNumEntriesImmMemTables,
+         {false, nullptr, &InternalStats::HandleNumEntriesImmMemTables, nullptr,
           nullptr}},
         {DB::Properties::kNumDeletesActiveMemTable,
          {false, nullptr, &InternalStats::HandleNumDeletesActiveMemTable,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kNumDeletesImmMemTables,
-         {false, nullptr, &InternalStats::HandleNumDeletesImmMemTables,
+         {false, nullptr, &InternalStats::HandleNumDeletesImmMemTables, nullptr,
           nullptr}},
         {DB::Properties::kEstimateNumKeys,
-         {false, nullptr, &InternalStats::HandleEstimateNumKeys, nullptr}},
+         {false, nullptr, &InternalStats::HandleEstimateNumKeys, nullptr,
+          nullptr}},
         {DB::Properties::kEstimateTableReadersMem,
-         {true, nullptr, &InternalStats::HandleEstimateTableReadersMem,
+         {true, nullptr, &InternalStats::HandleEstimateTableReadersMem, nullptr,
           nullptr}},
         {DB::Properties::kIsFileDeletionsEnabled,
-         {false, nullptr, &InternalStats::HandleIsFileDeletionsEnabled,
+         {false, nullptr, &InternalStats::HandleIsFileDeletionsEnabled, nullptr,
           nullptr}},
         {DB::Properties::kNumSnapshots,
-         {false, nullptr, &InternalStats::HandleNumSnapshots, nullptr}},
+         {false, nullptr, &InternalStats::HandleNumSnapshots, nullptr,
+          nullptr}},
         {DB::Properties::kOldestSnapshotTime,
-         {false, nullptr, &InternalStats::HandleOldestSnapshotTime, nullptr}},
+         {false, nullptr, &InternalStats::HandleOldestSnapshotTime, nullptr,
+          nullptr}},
         {DB::Properties::kNumLiveVersions,
-         {false, nullptr, &InternalStats::HandleNumLiveVersions, nullptr}},
+         {false, nullptr, &InternalStats::HandleNumLiveVersions, nullptr,
+          nullptr}},
         {DB::Properties::kCurrentSuperVersionNumber,
          {false, nullptr, &InternalStats::HandleCurrentSuperVersionNumber,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kEstimateLiveDataSize,
-         {true, nullptr, &InternalStats::HandleEstimateLiveDataSize, nullptr}},
+         {true, nullptr, &InternalStats::HandleEstimateLiveDataSize, nullptr,
+          nullptr}},
         {DB::Properties::kMinLogNumberToKeep,
-         {false, nullptr, &InternalStats::HandleMinLogNumberToKeep, nullptr}},
+         {false, nullptr, &InternalStats::HandleMinLogNumberToKeep, nullptr,
+          nullptr}},
         {DB::Properties::kBaseLevel,
-         {false, nullptr, &InternalStats::HandleBaseLevel, nullptr}},
+         {false, nullptr, &InternalStats::HandleBaseLevel, nullptr, nullptr}},
         {DB::Properties::kTotalSstFilesSize,
-         {false, nullptr, &InternalStats::HandleTotalSstFilesSize, nullptr}},
+         {false, nullptr, &InternalStats::HandleTotalSstFilesSize, nullptr,
+          nullptr}},
         {DB::Properties::kLiveSstFilesSize,
-         {false, nullptr, &InternalStats::HandleLiveSstFilesSize, nullptr}},
+         {false, nullptr, &InternalStats::HandleLiveSstFilesSize, nullptr,
+          nullptr}},
         {DB::Properties::kEstimatePendingCompactionBytes,
          {false, nullptr, &InternalStats::HandleEstimatePendingCompactionBytes,
-          nullptr}},
+          nullptr, nullptr}},
         {DB::Properties::kNumRunningFlushes,
-         {false, nullptr, &InternalStats::HandleNumRunningFlushes, nullptr}},
+         {false, nullptr, &InternalStats::HandleNumRunningFlushes, nullptr,
+          nullptr}},
         {DB::Properties::kNumRunningCompactions,
-         {false, nullptr, &InternalStats::HandleNumRunningCompactions,
+         {false, nullptr, &InternalStats::HandleNumRunningCompactions, nullptr,
           nullptr}},
         {DB::Properties::kActualDelayedWriteRate,
-         {false, nullptr, &InternalStats::HandleActualDelayedWriteRate,
+         {false, nullptr, &InternalStats::HandleActualDelayedWriteRate, nullptr,
           nullptr}},
         {DB::Properties::kIsWriteStopped,
-         {false, nullptr, &InternalStats::HandleIsWriteStopped, nullptr}},
-        {DB::Properties::kEstimateOldestKeyTime,
-         {false, nullptr, &InternalStats::HandleEstimateOldestKeyTime,
+         {false, nullptr, &InternalStats::HandleIsWriteStopped, nullptr,
           nullptr}},
+        {DB::Properties::kEstimateOldestKeyTime,
+         {false, nullptr, &InternalStats::HandleEstimateOldestKeyTime, nullptr,
+          nullptr}},
+        {DB::Properties::kBlockCacheCapacity,
+         {false, nullptr, &InternalStats::HandleBlockCacheCapacity, nullptr,
+          nullptr}},
+        {DB::Properties::kBlockCacheUsage,
+         {false, nullptr, &InternalStats::HandleBlockCacheUsage, nullptr,
+          nullptr}},
+        {DB::Properties::kBlockCachePinnedUsage,
+         {false, nullptr, &InternalStats::HandleBlockCachePinnedUsage, nullptr,
+          nullptr}},
+        {DB::Properties::kOptionsStatistics,
+         {false, nullptr, nullptr, nullptr,
+          &DBImpl::GetPropertyHandleOptionsStatistics}},
 };
 
 const DBPropertyInfo* GetPropertyInfo(const Slice& property) {
@@ -771,8 +814,8 @@ bool InternalStats::HandleEstimateTableReadersMem(uint64_t* value,
 }
 
 bool InternalStats::HandleEstimateLiveDataSize(uint64_t* value, DBImpl* /*db*/,
-                                               Version* /*version*/) {
-  const auto* vstorage = cfd_->current()->storage_info();
+                                               Version* version) {
+  const auto* vstorage = version->storage_info();
   *value = vstorage->EstimateLiveDataSize();
   return true;
 }
@@ -828,6 +871,58 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
                        cfd_->imm()->ApproximateOldestKeyTime(), *value});
   }
   return *value > 0 && *value < std::numeric_limits<uint64_t>::max();
+}
+
+bool InternalStats::HandleBlockCacheStat(Cache** block_cache) {
+  assert(block_cache != nullptr);
+  auto* table_factory = cfd_->ioptions()->table_factory;
+  assert(table_factory != nullptr);
+  if (BlockBasedTableFactory::kName != table_factory->Name()) {
+    return false;
+  }
+  auto* table_options =
+      reinterpret_cast<BlockBasedTableOptions*>(table_factory->GetOptions());
+  if (table_options == nullptr) {
+    return false;
+  }
+  *block_cache = table_options->block_cache.get();
+  if (table_options->no_block_cache || *block_cache == nullptr) {
+    return false;
+  }
+  return true;
+}
+
+bool InternalStats::HandleBlockCacheCapacity(uint64_t* value, DBImpl* /*db*/,
+                                             Version* /*version*/) {
+  Cache* block_cache;
+  bool ok = HandleBlockCacheStat(&block_cache);
+  if (!ok) {
+    return false;
+  }
+  *value = static_cast<uint64_t>(block_cache->GetCapacity());
+  return true;
+}
+
+bool InternalStats::HandleBlockCacheUsage(uint64_t* value, DBImpl* /*db*/,
+                                          Version* /*version*/) {
+  Cache* block_cache;
+  bool ok = HandleBlockCacheStat(&block_cache);
+  if (!ok) {
+    return false;
+  }
+  *value = static_cast<uint64_t>(block_cache->GetUsage());
+  return true;
+}
+
+bool InternalStats::HandleBlockCachePinnedUsage(uint64_t* value, DBImpl* /*db*/,
+                                                Version* /*version*/) {
+  Cache* block_cache;
+  bool ok = HandleBlockCacheStat(&block_cache);
+  if (!ok) {
+    return false;
+  }
+  *value = static_cast<uint64_t>(block_cache->GetPinnedUsage());
+  return true;
 }
 
 void InternalStats::DumpDBStats(std::string* value) {
